@@ -8,6 +8,12 @@
 #include <format>
 
 
+class NotImplemented : public std::logic_error
+{
+public:
+    NotImplemented() : std::logic_error("Function not yet implemented") { };
+};
+
 
 struct NamedField{
     std::string name;
@@ -64,15 +70,28 @@ struct ECRamTable{
         return ret;
     }
 
-    NamedField& getField(const std::string& name) {
-        return fields.at(field_map.at(name));
+    std::optional<NamedField> getField(const std::string& name) {
+        if (field_map.find(name) == field_map.end()){
+            return std::nullopt;
+        } else {
+            return fields.at(field_map.at(name));
+        }
+        //return fields.at(field_map.at(name));
     }
     
-    const NamedField& getField(const std::string& name) const {
-        return fields.at(field_map.at(name));
+    std::optional<NamedField> getField(const std::string& name) const {
+        if (field_map.find(name) == field_map.end()){
+            return std::nullopt;
+        } else {
+            return fields.at(field_map.at(name));
+        }
+        //return fields.at(field_map.at(name));
     }
 };
 
+
+constexpr size_t PAGE_SIZE = 4096;
+constexpr size_t PAGE_MASK = (PAGE_SIZE - 1);
 
 class MappedMemory{
 public:
@@ -82,7 +101,7 @@ public:
         if (fd == -1){
             throw std::runtime_error(std::format("Failed to open /dev/mem : {}", strerror(errno)));
         }
-        map_base = mmap(target, size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, fd , reinterpret_cast<size_t>(target) & ~PAGE_MASK);
+        map_base = mmap(target, size, PROT_READ, MAP_SHARED, fd , reinterpret_cast<size_t>(target) & ~PAGE_MASK);
         map_size = size;
     }
     ~MappedMemory(){
@@ -97,20 +116,35 @@ public:
     void* map_base;
     void* target;
     size_t map_size;
-    
-    inline static constexpr size_t PAGE_SIZE = 4096;
-    inline static constexpr size_t PAGE_MASK = (PAGE_SIZE - 1);
 };
+
+inline uint32_t readNamedField(const NamedField& field, const MappedMemory& mapped_memory){
+    uint32_t value = 0;
+    memcpy(&value, static_cast<uint8_t*>(mapped_memory.getVirt()) + field.byte_offset, field.bytes);
+    value = value & field.bitmask;
+    int bit_index = __builtin_ctz(field.bitmask);
+    value = value >> bit_index;
+    return value;
+}
 
 std::vector<std::tuple<std::string, uint32_t>> readECRamTable(const ECRamTable& ec_ram_table, const MappedMemory& mapped_memory){
     std::vector<std::tuple<std::string, uint32_t>> ret;
     for (const auto& field : ec_ram_table.fields){
-        uint32_t value = 0;
-        memcpy(&value, static_cast<uint8_t*>(mapped_memory.getVirt()) + field.byte_offset, field.bytes);
-        value = value & field.bitmask;
+        auto value = readNamedField(field, mapped_memory);
         ret.emplace_back(std::make_tuple(field.name, value));
     }
     return ret;
+}
+
+std::optional<std::tuple<std::string, uint32_t>> queryECRamTable(const ECRamTable& ec_ram_table, const MappedMemory& mapped_memory, const std::string& field_name){
+    const auto& field = ec_ram_table.getField(field_name);
+    if (field){
+        auto value = readNamedField(*field, mapped_memory);
+        return std::make_tuple(field->name, value);
+    } else {
+        printf("Field %s not found, ignoring\n", field_name.c_str());
+        return std::nullopt;
+    }
 }
 
 int show(const std::string& filename){
@@ -135,36 +169,41 @@ int scan(const std::string& filename){
     for (const auto& [name, value] : values){
         printf("[%s] 0x%08X\n", name.c_str(), value);
     }
-    
     return 0;
 }
 
-int run(const std::string& filename){
+int query(const std::string& filename, const std::vector<std::string>& field_names){
     auto file_str = readFile(filename);
     const auto& [opr_info, newstr] = parseOperationRegion(file_str);
-    std::cout << newstr << std::endl;
     const auto& field_vec = extractFields(newstr);
-    // for (const auto& field : field_vec){
-    //     field.print();
-    // }
     const auto& ec_ram_table = ECRamTable::buildECRamTable(opr_info, field_vec);
-    std::cout << "Address: " << ec_ram_table.address << " Size: " << ec_ram_table.size << std::endl;
-    for (const auto& field : ec_ram_table.fields){
-        field.print();
+    MappedMemory mapped_memory(reinterpret_cast<void*>(ec_ram_table.address), ec_ram_table.size);
+    for (const auto& field_name : field_names){
+        const auto& query_result = queryECRamTable(ec_ram_table, mapped_memory, field_name);
+        if (query_result){
+            const auto& [name, value] = *query_result;
+            printf("[%s] 0x%08X\n", name.c_str(), value);
+        }
     }
-    ec_ram_table.getField("CNID").print();
     return 0;
 }
+
 
 
 int main(int argc, char *argv[]) {
     argparse::ArgumentParser program("ecscanner");
+    program.add_description("A tool for reading EC RAM");
     program.add_argument("action")
         .help("action to take: [show] ECRam symbol table, [scan] ECRam symbol values, [query] ECRam symbol, [monitor] ECRam symbol values")
         .choices("show", "scan", "query", "monitor");
     program.add_argument("filename")
         .help("input file")
         .metavar("FILENAME");
+    program.add_argument("field")
+        .help("field names for query mode")
+        .nargs(argparse::nargs_pattern::any);
+    
+
     try {
       program.parse_args(argc, argv);
     }
@@ -173,24 +212,24 @@ int main(int argc, char *argv[]) {
       std::cerr << program;
       return 1;
     }
+
+    std::string filename = program.get<std::string>("filename");
     std::string action = program.get<std::string>("action");
+    std::vector<std::string> queries = program.get<std::vector<std::string>>("field");
+
+
     if (action == "show"){
-        show(program.get<std::string>("filename"));
+        show(filename);
     }
     else if (action == "scan"){
-        scan(program.get<std::string>("filename"));
+        scan(filename);
     }
     else if (action == "query"){
-        //run(program.get<std::string>("filename"));
+        query(filename, queries);
     }
     else if (action == "monitor"){
-        //run(program.get<std::string>("filename"));
+        throw NotImplemented();
     }
-
-    //auto input = program.get<std::string>("filename");
-    //run(input);
-    //std::cout << file_str << std::endl;
-    //const auto& xx = MappedMemory(reinterpret_cast<void*>(0x400),4111);
 
     return 0;
 }
