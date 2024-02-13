@@ -13,12 +13,5 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(argparse)
 
-FetchContent_Declare(
-    lexertk
-    GIT_REPOSITORY https://github.com/ArashPartow/lexertk.git
-)
-FetchContent_MakeAvailable(lexertk)
-
-add_executable(devmem devmem2.c)
 add_executable(ecscanner ecsanner.cpp parser.cpp)
 target_link_libraries(ecscanner argparse)
