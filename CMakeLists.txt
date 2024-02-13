@@ -20,5 +20,5 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(lexertk)
 
 add_executable(devmem devmem2.c)
-add_executable(ecscanner ecsanner.cpp)
+add_executable(ecscanner ecsanner.cpp parser.cpp)
 target_link_libraries(ecscanner argparse)

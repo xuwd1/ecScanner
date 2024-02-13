@@ -1,36 +1,196 @@
-#include <regex>
 #include <argparse/argparse.hpp>
-#include <fstream>
-#include <sstream>
+#include <fcntl.h>
+#include <string.h>
 #include <string>
+#include <sys/mman.h>
+#include <tuple>
+#include "parser.hpp"
+#include <format>
 
-std::string readFile(const std::string& filePath) {
-    std::ifstream file(filePath);
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    return buffer.str();
+
+
+struct NamedField{
+    std::string name;
+    uint32_t bitmask;
+    uint32_t byte_offset;  
+    uint32_t bytes;
+    void print() const{
+        printf("[%s] Dword Mask: 0x%08x, Byte Offset: 0x%02x, Size: %02u\n", name.c_str(), bitmask, byte_offset, bytes);
+    }
+};
+
+struct ECRamTable{
+    uint32_t address;
+    uint32_t size;
+    std::vector<NamedField> fields;  
+    std::unordered_map<std::string, size_t> field_map;
+
+    static ECRamTable buildECRamTable(const OperationRegionInfo& opr_info, const std::vector<Field>& field_vec){
+        ECRamTable ret;
+        ret.address = opr_info.address;
+        ret.size = opr_info.size;
+        uint32_t bit_offset = 0;
+        for (const auto& field : field_vec){
+            switch (field.type){
+                case FieldType::kNamedField:{
+                    uint32_t byte_offset = bit_offset / 8;
+                    uint32_t new_bit_offset = bit_offset + field.bitwidth;
+                    uint32_t _bit = byte_offset * 8;
+                    uint32_t _lo = bit_offset - _bit;
+                    uint32_t _hi = new_bit_offset - _bit;
+                    /*
+                        xxxxXXXXXXXXXXXXxxxxxxxxxxx
+                        |   |           |
+                        |   bit_offset  new_bit_offset
+                        |
+                        _bit
+                    */
+                    decltype(NamedField::bitmask) bitmask = (~(std::numeric_limits<int64_t>::max() << _hi)) & (std::numeric_limits<int64_t>::max() << _lo);
+                    ret.fields.emplace_back(NamedField{field.name, bitmask, byte_offset, (_hi+7)/8});
+                    ret.field_map[field.name] = ret.fields.size() - 1;
+                    bit_offset += field.bitwidth;
+                    break;
+                }
+                case FieldType::kPadding:{
+                    bit_offset += field.bitwidth;
+                    break;
+                }
+                case FieldType::kOffset:{
+                    bit_offset = field.offset * 8;
+                    break;
+                }
+            }
+        }
+        return ret;
+    }
+
+    NamedField& getField(const std::string& name) {
+        return fields.at(field_map.at(name));
+    }
+    
+    const NamedField& getField(const std::string& name) const {
+        return fields.at(field_map.at(name));
+    }
+};
+
+
+class MappedMemory{
+public:
+    MappedMemory(void* target, size_t size): target(target){
+        int fd;
+        fd = open("/dev/mem", O_RDWR|O_SYNC);
+        if (fd == -1){
+            throw std::runtime_error(std::format("Failed to open /dev/mem : {}", strerror(errno)));
+        }
+        map_base = mmap(target, size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, fd , reinterpret_cast<size_t>(target) & ~PAGE_MASK);
+        map_size = size;
+    }
+    ~MappedMemory(){
+        munmap(map_base, map_size);
+    }
+
+    void* getVirt() const{
+        size_t map_base_sizet = reinterpret_cast<size_t>(map_base) + (reinterpret_cast<size_t>(target) & PAGE_MASK);
+        return reinterpret_cast<void*>(map_base_sizet);
+    }
+
+    void* map_base;
+    void* target;
+    size_t map_size;
+    
+    inline static constexpr size_t PAGE_SIZE = 4096;
+    inline static constexpr size_t PAGE_MASK = (PAGE_SIZE - 1);
+};
+
+std::vector<std::tuple<std::string, uint32_t>> readECRamTable(const ECRamTable& ec_ram_table, const MappedMemory& mapped_memory){
+    std::vector<std::tuple<std::string, uint32_t>> ret;
+    for (const auto& field : ec_ram_table.fields){
+        uint32_t value = 0;
+        memcpy(&value, static_cast<uint8_t*>(mapped_memory.getVirt()) + field.byte_offset, field.bytes);
+        value = value & field.bitmask;
+        ret.emplace_back(std::make_tuple(field.name, value));
+    }
+    return ret;
+}
+
+int show(const std::string& filename){
+    auto file_str = readFile(filename);
+    const auto& [opr_info, newstr] = parseOperationRegion(file_str);
+    const auto& field_vec = extractFields(newstr);
+    const auto& ec_ram_table = ECRamTable::buildECRamTable(opr_info, field_vec);
+    printf("ECRam Mapped address: 0x%08X Size: %u\n", ec_ram_table.address, ec_ram_table.size);
+    for (const auto& field : ec_ram_table.fields){
+        field.print();
+    }
+    return 0;
+}
+
+int scan(const std::string& filename){
+    auto file_str = readFile(filename);
+    const auto& [opr_info, newstr] = parseOperationRegion(file_str);
+    const auto& field_vec = extractFields(newstr);
+    const auto& ec_ram_table = ECRamTable::buildECRamTable(opr_info, field_vec);
+    MappedMemory mapped_memory(reinterpret_cast<void*>(ec_ram_table.address), ec_ram_table.size);
+    const auto& values = readECRamTable(ec_ram_table, mapped_memory);
+    for (const auto& [name, value] : values){
+        printf("[%s] 0x%08X\n", name.c_str(), value);
+    }
+    
+    return 0;
+}
+
+int run(const std::string& filename){
+    auto file_str = readFile(filename);
+    const auto& [opr_info, newstr] = parseOperationRegion(file_str);
+    std::cout << newstr << std::endl;
+    const auto& field_vec = extractFields(newstr);
+    // for (const auto& field : field_vec){
+    //     field.print();
+    // }
+    const auto& ec_ram_table = ECRamTable::buildECRamTable(opr_info, field_vec);
+    std::cout << "Address: " << ec_ram_table.address << " Size: " << ec_ram_table.size << std::endl;
+    for (const auto& field : ec_ram_table.fields){
+        field.print();
+    }
+    ec_ram_table.getField("CNID").print();
+    return 0;
 }
 
 
 int main(int argc, char *argv[]) {
-  argparse::ArgumentParser program("ecscanner");
+    argparse::ArgumentParser program("ecscanner");
+    program.add_argument("action")
+        .help("action to take: [show] ECRam symbol table, [scan] ECRam symbol values, [query] ECRam symbol, [monitor] ECRam symbol values")
+        .choices("show", "scan", "query", "monitor");
+    program.add_argument("filename")
+        .help("input file")
+        .metavar("FILENAME");
+    try {
+      program.parse_args(argc, argv);
+    }
+    catch (const std::exception& err) {
+      std::cerr << err.what() << std::endl;
+      std::cerr << program;
+      return 1;
+    }
+    std::string action = program.get<std::string>("action");
+    if (action == "show"){
+        show(program.get<std::string>("filename"));
+    }
+    else if (action == "scan"){
+        scan(program.get<std::string>("filename"));
+    }
+    else if (action == "query"){
+        //run(program.get<std::string>("filename"));
+    }
+    else if (action == "monitor"){
+        //run(program.get<std::string>("filename"));
+    }
 
-  program.add_argument("filename")
-    .help("input file")
-    .metavar("FILENAME");
+    //auto input = program.get<std::string>("filename");
+    //run(input);
+    //std::cout << file_str << std::endl;
+    //const auto& xx = MappedMemory(reinterpret_cast<void*>(0x400),4111);
 
-  try {
-    program.parse_args(argc, argv);
-  }
-  catch (const std::exception& err) {
-    std::cerr << err.what() << std::endl;
-    std::cerr << program;
-    return 1;
-  }
-
-  auto input = program.get<std::string>("filename");
-  auto file_str = readFile(input);
-  std::cout << file_str << std::endl;
-
-  return 0;
+    return 0;
 }
