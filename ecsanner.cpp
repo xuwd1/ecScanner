@@ -76,7 +76,6 @@ struct ECRamTable{
         } else {
             return fields.at(field_map.at(name));
         }
-        //return fields.at(field_map.at(name));
     }
     
     std::optional<NamedField> getField(const std::string& name) const {
@@ -85,7 +84,6 @@ struct ECRamTable{
         } else {
             return fields.at(field_map.at(name));
         }
-        //return fields.at(field_map.at(name));
     }
 };
 
